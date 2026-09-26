@@ -204,6 +204,89 @@ class AuthResultsAttributionTests(unittest.TestCase):
         self.assertEqual(entry["authserv_id"], "edge.org")
         self.assertEqual(entry["status"], "own")
 
+    def test_authserv_id_preceding_comment_with_semicolon(self):
+        # 合法前置注释里出现分号：不得截断 authserv-id（旧实现会误判身份不符）
+        raw = (
+            "Authentication-Results: (edge node; mx tier 1) edge.org;\n"
+            "\tspf=pass smtp.mailfrom=x.example\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["authserv_id"], "edge.org")
+        self.assertEqual(entry["hop_by_host"], "edge.org")
+        self.assertEqual(entry["status"], "own")
+
+    def test_authserv_id_preceding_comment_semicolon_case_and_dot(self):
+        # 前置注释含分号，authserv-id 仍做大小写 / 末尾点规范化后与 by 匹配
+        raw = (
+            "Authentication-Results: (added by edge; tier) EDGE.Org.; spf=pass\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        self.assertEqual(result["results"][0]["status"], "own")
+
+    def test_methods_ignore_nested_comments(self):
+        # 嵌套注释里的 dkim=pass / 分号不得生成真实声明或切段
+        raw = (
+            "Authentication-Results: edge.org;\n"
+            "\tspf=pass smtp.mailfrom=x.example;\n"
+            "\t(upstream note (dkim=pass header.d=evil.example) trailing);\n"
+            "\tdmarc=fail header.from=x.example\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        methods = result["results"][0]["methods"]
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in methods],
+            [("spf", "pass"), ("dmarc", "fail")],
+        )
+
+    def test_methods_ignore_escaped_parens_and_semicolons_in_comments(self):
+        # 反斜杠转义：\) 不闭合注释，注释内分号不切段；\; 在注释内同样不切
+        raw = (
+            r"Authentication-Results: (escaped \) still comment; mx) edge.org;"
+            "\n\tspf=pass smtp.mailfrom=x.example;"
+            "\n\tdkim=pass (sig \(ok\); verified) header.d=x.example"
+            "\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["authserv_id"], "edge.org")
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "pass"), ("dkim", "pass")],
+        )
+
+    def test_unclosed_comment_extracts_nothing_inside(self):
+        raw = (
+            "Authentication-Results: edge.org;\n"
+            "\tspf=pass smtp.mailfrom=x.example; (unclosed dkim=pass header.d=x\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        methods = result["results"][0]["methods"]
+        self.assertEqual([(m["method"], m["result"]) for m in methods], [("spf", "pass")])
+
+    def test_methods_extracted_when_authserv_id_absent(self):
+        # 无 authserv-id 时首段本身就是方法声明，不得因“首段”而漏掉
+        from mailtrace.parsing.authres import _extract_methods
+
+        methods = _extract_methods(
+            "spf=pass smtp.mailfrom=x.example; dkim=pass header.d=x.example"
+        )
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in methods],
+            [("spf", "pass"), ("dkim", "pass")],
+        )
+
     def test_methods_ignore_props_and_comments(self):
         raw = (
             "Authentication-Results: edge.org;\n"
@@ -322,6 +405,36 @@ class AuthResultsApiTests(unittest.TestCase):
         self.assertEqual(data["own_count"], 1)
         self.assertEqual(data["results"][0]["status"], "own")
         self.assertEqual(len(data["auth_summary"]), 3)
+
+    def test_api_nested_comment_does_not_invent_claim(self):
+        # JSON 与页面共用同一份分析结果：嵌套注释里的 dkim=pass 不得出现
+        raw = (
+            "Authentication-Results: (edge; mx) edge.org;\n"
+            "\tspf=pass smtp.mailfrom=x.example;\n"
+            "\t(note (dkim=pass header.d=evil.example)); dmarc=fail\n"
+            + BASE_RECEIVED
+        )
+        resp = self.client.post(
+            "/api/analyze/auth-results",
+            json={"headers": raw, "trusted_hosts": HOSTS},
+        )
+        self.assertEqual(resp.status_code, 200)
+        entry = resp.get_json()["results"][0]
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "pass"), ("dmarc", "fail")],
+        )
+        page = self.client.post(
+            "/auth-results",
+            data={"headers_authres": raw, "trusted_hosts_authres": "edge.org\ngw2.org"},
+        )
+        self.assertEqual(page.status_code, 200)
+        body = page.get_data(as_text=True)
+        self.assertIn("本组织声明", body)
+        # 方法徽章只有 spf=pass / dmarc=fail；嵌套注释不产生 dkim 徽章
+        self.assertIn("spf=pass", body)
+        self.assertNotIn(">dkim=pass<", body)
 
     def test_api_empty_hostlist_400(self):
         resp = self.client.post(

@@ -5,9 +5,11 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mailtrace.parsing.parser import (  # noqa: E402
+    _strip_paren_comments,
     analyze_headers,
     parse_header_blocks,
     parse_received_date,
+    split_uncommented,
 )
 
 
@@ -237,6 +239,46 @@ class IpAndTzTests(unittest.TestCase):
         result = analyze_headers(headers)
         self.assertIsNone(result["path"][0]["time_utc"])
         self.assertEqual(result["error_count"], 1)
+
+
+class CommentScanningTests(unittest.TestCase):
+    def test_strip_nested_comments(self):
+        text = "a (outer (inner) tail) b"
+        out = _strip_paren_comments(text)
+        self.assertEqual(out, "a" + " " * (len(text) - 2) + "b")
+
+    def test_strip_handles_escaped_parens(self):
+        # \( 与 \) 是注释内字面量，不闭合注释
+        text = r"a (x \( y \) z) b"
+        out = _strip_paren_comments(text)
+        self.assertEqual(out, "a" + " " * (len(text) - 2) + "b")
+
+    def test_unmatched_close_paren_is_literal(self):
+        self.assertEqual(_strip_paren_comments("a) b"), "a) b")
+
+    def test_unclosed_comment_extends_to_end(self):
+        self.assertEqual(_strip_paren_comments("a (unclosed b"), "a            ")
+
+    def test_split_only_on_semicolons_outside_comments(self):
+        value = "host; spf=pass; (note; (dkim=pass)); dmarc=fail"
+        self.assertEqual(
+            [s.strip() for s in split_uncommented(value)],
+            ["host", "spf=pass", "", "dmarc=fail"],
+        )
+
+    def test_split_escaped_semicolon_outside_comment_is_not_separator(self):
+        self.assertEqual(
+            split_uncommented(r"a\;b; c"),
+            [r"a\;b", " c"],
+        )
+
+    def test_nested_comment_keyword_does_not_truncate_from_clause(self):
+        # 嵌套注释里的 by 不得截断 from 子句，对端 IP 仍取自 from 范围
+        headers = (
+            "Received: from h.example (verified (by someone) [2001:db8::5])\n"
+            "\tby mx.example; Wed, 23 Sep 2026 02:04:00 +0800\n"
+        )
+        self.assertEqual(analyze_headers(headers)["path"][0]["ip"], "2001:db8::5")
 
 
 if __name__ == "__main__":

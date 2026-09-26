@@ -302,6 +302,56 @@ class SenderAlignmentTests(unittest.TestCase):
             result["claims"][0]["identity_domain"], "mail.partner.example"
         )
 
+    def test_preceding_comment_with_semicolon_still_own_claim(self):
+        # 前置注释含分号不得截断 authserv-id：字段仍归属本组织、声明被采纳
+        raw = _headers(
+            [
+                "Authentication-Results: (edge node; mx tier) edge.org;\n"
+                "\tdkim=pass header.d=mail.partner.example"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(result["status"], "aligned")
+        self.assertEqual(result["own_count"], 1)
+        self.assertEqual(len(result["claims"]), 1)
+        self.assertEqual(
+            result["claims"][0]["identity_domain"], "mail.partner.example"
+        )
+
+    def test_nested_comment_does_not_create_claim(self):
+        # 嵌套注释内的 dkim=pass header.d=evil.example 不得生成声明或身份属性
+        raw = _headers(
+            [
+                "Authentication-Results: edge.org;\n"
+                "\tdkim=pass header.d=mail.partner.example;\n"
+                "\t(legacy (dkim=pass header.d=evil.example) remark)"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(result["status"], "aligned")
+        self.assertEqual(result["claim_count"], 1)
+        claim = result["claims"][0]
+        self.assertEqual(claim["method"], "dkim")
+        self.assertEqual(claim["identity_raw"], "mail.partner.example")
+
+    def test_comment_semicolon_does_not_split_claim(self):
+        # 注释（含反斜杠转义的括号）内的分号不切段，真实声明顺序与重复保留
+        raw = _headers(
+            [
+                r"Authentication-Results: edge.org;"
+                "\n\tdkim=pass (sig \(ok\); verified) header.d=mail.partner.example;\n"
+                "\tdkim=fail header.d=other.example"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(
+            [(c["method"], c["result"], c["status"]) for c in result["claims"]],
+            [
+                ("dkim", "pass", "aligned"),
+                ("dkim", "fail", "not_pass"),
+            ],
+        )
+
     def test_empty_hostlist_is_input_error(self):
         result = audit_sender_alignment(_headers([]), "  \n, ", ORG, "strict")
         self.assertIn("error", result)

@@ -148,9 +148,68 @@ def parse_header_blocks(text: str) -> list[HeaderBlock]:
     return blocks
 
 
+def _comment_mask_chars(text: str) -> list[str]:
+    """逐字符扫描并屏蔽 RFC 5322 圆括号注释，返回等长字符列表（注释位置为空格）。
+
+    与纯正则不同，这里识别**任意深度的嵌套圆括号**与反斜杠转义：
+    - ``(`` 使注释深度加一、``)`` 减一，仅深度为 0 的字符是注释外文本；
+    - 反斜杠转义其后一个字符（``\\;`` / ``\\)`` / ``\\(`` 均为字面量，
+      不充当分号分隔符，也不改变注释深度）；
+    - 未闭合的注释按注释处理到文本末尾；注释外多余的 ``)`` 视为普通字符。
+    """
+    chars = list(text)
+    depth = 0
+    escaped = False
+    for i, ch in enumerate(chars):
+        if escaped:
+            # 上一个字符是反斜杠：本字符是字面量，仅在注释内时掩码
+            escaped = False
+            if depth:
+                chars[i] = " "
+            continue
+        if ch == "\\":
+            escaped = True
+            if depth:
+                chars[i] = " "
+        elif ch == "(":
+            depth += 1
+            chars[i] = " "
+        elif ch == ")" and depth:
+            depth -= 1
+            chars[i] = " "
+        elif depth:
+            chars[i] = " "
+    return chars
+
+
 def _strip_paren_comments(text: str) -> str:
-    """删除 Received 字段里的圆括号注释（不支持嵌套注释的极端写法）。"""
-    return re.sub(r"\([^()]*\)", " ", text)
+    """删除字段值中的圆括号注释（支持任意深度嵌套与反斜杠转义），注释替换为空格。"""
+    return "".join(_comment_mask_chars(text))
+
+
+def split_uncommented(text: str, separator: str = ";") -> list[str]:
+    """按注释外的分隔符切段，返回注释已整体替换为空格的各段原文。
+
+    分隔符若出现在（含嵌套的）圆括号注释内、或被反斜杠转义，则不切分；
+    注释内容保留为空格占位，绝不可能被调用方当作真实 token（认证方法、
+    身份属性等）解析。段顺序与原文一致，重复声明不会被去重或重排。
+    """
+    # 注释（含其中的分号与反斜杠）已被掩码为空格，只需在注释外文本上
+    # 跳过被反斜杠转义的分隔符即可。
+    chars = _comment_mask_chars(text)
+    segments: list[str] = []
+    start = 0
+    escaped = False
+    for i, ch in enumerate(chars):
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == separator:
+            segments.append("".join(chars[start:i]))
+            start = i + 1
+    segments.append("".join(chars[start:]))
+    return segments
 
 
 def _coerce_valid_datetime(dt: datetime) -> bool:
@@ -242,10 +301,10 @@ def _from_clause_span(received_part: str) -> tuple[int, int] | None:
     方括号中的地址）；``from`` 子句不存在时返回 ``None``——对端 IP
     只允许取自该子句。
     """
-    # 屏蔽圆括号注释与方括号字面量，再在干净文本上定位子句关键词
-    masked_chars = list(received_part)
-    for cm in re.finditer(r"\([^()]*\)|\[[^\[\]]*\]", received_part):
-        for i in range(cm.start(), cm.end()):
+    # 屏蔽圆括号注释（支持嵌套与转义）与方括号字面量，再在干净文本上定位关键词
+    masked_chars = _comment_mask_chars(received_part)
+    for m in re.finditer(r"\[[^\[\]]*\]", received_part):
+        for i in range(m.start(), m.end()):
             masked_chars[i] = " "
     masked = "".join(masked_chars)
 
