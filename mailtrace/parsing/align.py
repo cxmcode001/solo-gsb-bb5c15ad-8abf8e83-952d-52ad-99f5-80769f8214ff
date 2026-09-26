@@ -34,7 +34,7 @@ import re
 from email.utils import getaddresses
 
 from mailtrace.parsing.authres import STATUS_OWN, analyze_auth_results
-from mailtrace.parsing.parser import _strip_paren_comments, parse_header_blocks
+from mailtrace.parsing.parser import _split_semicolon_segments, parse_header_blocks
 from mailtrace.parsing.trust import parse_trusted_hosts
 
 # 总体结论
@@ -214,13 +214,13 @@ def _parse_from_domain(blocks: list) -> dict:
 def _extract_claims(value: str) -> list[dict]:
     """从一条 Authentication-Results 字段值提取 spf / dkim 声明及身份属性。
 
-    保持原文顺序与重复；圆括号注释先剥离，避免注释里的分号或等号干扰
-    切分。每条声明记录方法、结果词与对应身份属性（spf → smtp.mailfrom，
-    dkim → header.d）的原始值。
+    与认证结果来源共用同一划段口径：只按注释外的分号划段（注释支持
+    嵌套圆括号与反斜杠转义），注释内容不产生声明或身份属性；保持
+    原文顺序与重复。每条声明记录方法、结果词与对应身份属性
+    （spf → smtp.mailfrom，dkim → header.d）的原始值。
     """
-    cleaned = _strip_paren_comments(value)
     claims: list[dict] = []
-    for segment in cleaned.split(";"):
+    for segment in _split_semicolon_segments(value):
         segment = segment.strip()
         if not segment or "=" not in segment:
             continue

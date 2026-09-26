@@ -204,6 +204,92 @@ class AuthResultsAttributionTests(unittest.TestCase):
         self.assertEqual(entry["authserv_id"], "edge.org")
         self.assertEqual(entry["status"], "own")
 
+    def test_leading_comment_with_semicolon_keeps_authserv_id(self):
+        # 前置注释含分号：注释清理后首段仍是 authserv-id，不得误判身份不符
+        raw = (
+            "Authentication-Results: (mx tier; inbound) edge.org; spf=pass\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["authserv_id"], "edge.org")
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "pass")],
+        )
+
+    def test_nested_comment_claim_not_adopted(self):
+        # 嵌套注释内的 dkim=pass 不得当成真实声明
+        raw = (
+            "Authentication-Results: edge.org;\n"
+            "\tspf=none (see (nested); dkim=pass header.d=evil.example)\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "none")],
+        )
+
+    def test_escaped_paren_does_not_end_comment(self):
+        # 反斜杠转义的 \) 不结束注释：注释内的声明字样不生效，
+        # 注释结束后的真实声明照常提取
+        raw = (
+            "Authentication-Results: edge.org;\n"
+            "\tspf=none (see \\) dkim=pass header.d=evil.example); dmarc=pass\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "none"), ("dmarc", "pass")],
+        )
+
+    def test_comment_semicolon_no_split_and_duplicates_keep_order(self):
+        # 注释内的分号不划段、注释内的声明字样不生成声明；
+        # 注释外重复声明维持原文顺序
+        raw = (
+            "Authentication-Results: edge.org;\n"
+            "\tdkim=pass (key; 1024-bit) header.d=a.example;\n"
+            "\t(dkim=fail) dkim=fail header.d=b.example; dkim=pass header.d=c.example\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("dkim", "pass"), ("dkim", "fail"), ("dkim", "pass")],
+        )
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in result["auth_summary"]],
+            [("dkim", "pass"), ("dkim", "fail"), ("dkim", "pass")],
+        )
+
+    def test_unterminated_comment_swallows_rest_of_value(self):
+        # 未闭合的注释视为延续到字段值末尾：其后的声明字样不生效
+        raw = (
+            "Authentication-Results: edge.org; spf=pass (note; dkim=pass\n"
+            + _received("gw2.org", "edge.org")
+            + "\nSubject: hi\n"
+        )
+        result = analyze_auth_results(raw, HOSTS)
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "pass")],
+        )
+
     def test_methods_ignore_props_and_comments(self):
         raw = (
             "Authentication-Results: edge.org;\n"
@@ -323,6 +409,27 @@ class AuthResultsApiTests(unittest.TestCase):
         self.assertEqual(data["results"][0]["status"], "own")
         self.assertEqual(len(data["auth_summary"]), 3)
 
+    def test_api_json_leading_comment_with_semicolon(self):
+        # 前置注释含分号：API 与页面共用同一划段口径，仍判定本组织声明
+        raw = (
+            "Authentication-Results: (mx tier; inbound) edge.org;\n"
+            "\tspf=pass (see (nested); dkim=pass header.d=evil.example)\n"
+            + BASE_RECEIVED
+        )
+        resp = self.client.post(
+            "/api/analyze/auth-results",
+            json={"headers": raw, "trusted_hosts": HOSTS},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        entry = data["results"][0]
+        self.assertEqual(entry["authserv_id"], "edge.org")
+        self.assertEqual(entry["status"], "own")
+        self.assertEqual(
+            [(m["method"], m["result"]) for m in entry["methods"]],
+            [("spf", "pass")],
+        )
+
     def test_api_empty_hostlist_400(self):
         resp = self.client.post(
             "/api/analyze/auth-results",
@@ -393,6 +500,24 @@ class AuthResultsApiTests(unittest.TestCase):
         self.assertIn("身份不符", body)
         self.assertIn("无对应跳", body)
         self.assertIn("dkim=fail", body)
+
+    def test_page_form_leading_comment_renders_own(self):
+        # 页面与 JSON API 展示一致：前置注释含分号仍判定本组织声明
+        raw = (
+            "Authentication-Results: (mx tier; inbound) edge.org; spf=pass\n"
+            + BASE_RECEIVED
+        )
+        resp = self.client.post(
+            "/auth-results",
+            data={
+                "headers_authres": raw,
+                "trusted_hosts_authres": "edge.org\ngw2.org",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn("本组织声明", body)
+        self.assertIn("edge.org", body)
 
     def test_page_form_shows_no_org_claims(self):
         resp = self.client.post(

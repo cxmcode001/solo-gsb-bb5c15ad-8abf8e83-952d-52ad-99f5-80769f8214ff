@@ -153,6 +153,45 @@ def _strip_paren_comments(text: str) -> str:
     return re.sub(r"\([^()]*\)", " ", text)
 
 
+def _split_semicolon_segments(value: str) -> list[str]:
+    """按注释外的分号把字段值划段，并剔除圆括号注释。
+
+    扫描时识别 RFC 5322 风格的注释：圆括号可**嵌套**，注释内的反斜杠
+    转义（quoted-pair，如 ``\\)``）不结束注释；整段注释替换为一个空格
+    （避免粘连注释两侧的 token），注释内的分号不划段、注释内容（含
+    其中的 ``method=result`` 字样）不进入任何返回段。未闭合的注释
+    视为一直延续到字段值末尾。
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    depth = 0
+    i = 0
+    length = len(value)
+    while i < length:
+        ch = value[i]
+        if depth:
+            if ch == "\\" and i + 1 < length:
+                i += 2  # quoted-pair：下一字符按字面处理，不影响注释深度
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+            continue
+        if ch == "(":
+            depth = 1
+            current.append(" ")
+        elif ch == ";":
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    segments.append("".join(current))
+    return segments
+
+
 def _coerce_valid_datetime(dt: datetime) -> bool:
     return MIN_VALID_YEAR <= dt.year <= MAX_VALID_YEAR
 

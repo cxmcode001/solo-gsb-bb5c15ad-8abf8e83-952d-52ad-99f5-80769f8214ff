@@ -17,11 +17,15 @@
 对本组织声明提取 ``spf`` / ``dkim`` / ``dmarc`` 的结果词，按原文顺序
 展示并**保留重复声明**；没有可信前缀（或没有任何字段归属本组织）时，
 通过 ``no_org_claims`` / ``no_org_reason`` 明确表示“无本组织声明”。
+
+扫描字段值时识别 RFC 5322 风格的圆括号注释（支持嵌套与反斜杠转义），
+只按**注释外**的分号划段：authserv-id 取自清理注释后的首段（前置注释
+含分号也不会截断），注释内容不产生认证方法或身份属性。
 """
 
 from __future__ import annotations
 
-from mailtrace.parsing.parser import _strip_paren_comments, parse_header_blocks
+from mailtrace.parsing.parser import _split_semicolon_segments, parse_header_blocks
 from mailtrace.parsing.trust import (
     STATUS_ESTABLISHED,
     STATUS_NO_RECEIVED,
@@ -57,12 +61,13 @@ METHODS_OF_INTEREST = ("spf", "dkim", "dmarc")
 
 
 def _parse_authserv_id(value: str) -> str | None:
-    """取 AR 字段的 authserv-id（第一个分号前的标识，圆括号注释先剥离）。
+    """取 AR 字段的 authserv-id（清理圆括号注释后的首段标识）。
 
+    划段识别嵌套圆括号与反斜杠转义，注释内的分号不会截断首段；
     缺失（字段直接以 ``method=result`` 开头）、空值或 ``none``
     （RFC 7601 的“未做认证”占位）时返回 ``None``。
     """
-    first = _strip_paren_comments(value.split(";", 1)[0]).strip()
+    first = _split_semicolon_segments(value)[0].strip()
     if not first or "=" in first:
         return None
     token = first.split()[0]
@@ -74,13 +79,12 @@ def _parse_authserv_id(value: str) -> str | None:
 def _extract_methods(value: str) -> list[dict]:
     """提取 spf / dkim / dmarc 的 ``method=结果词``，保持原文顺序与重复。
 
-    结果词为 ``=`` 后的第一个空白分隔词（其后的属性如
-    ``smtp.mailfrom=`` / ``header.d=`` 不纳入）；圆括号注释先剥离，
-    避免注释里的分号或等号干扰切分。
+    只按注释外的分号划段（注释支持嵌套圆括号与反斜杠转义），注释
+    内容不产生声明；结果词为 ``=`` 后的第一个空白分隔词（其后的
+    属性如 ``smtp.mailfrom=`` / ``header.d=`` 不纳入）。
     """
-    cleaned = _strip_paren_comments(value)
     methods: list[dict] = []
-    for segment in cleaned.split(";"):
+    for segment in _split_semicolon_segments(value):
         segment = segment.strip()
         if not segment or "=" not in segment:
             continue

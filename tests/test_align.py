@@ -302,6 +302,69 @@ class SenderAlignmentTests(unittest.TestCase):
             result["claims"][0]["identity_domain"], "mail.partner.example"
         )
 
+    def test_leading_comment_with_semicolon_still_aligned(self):
+        # 前置注释含分号：authserv-id 仍从清理注释后的首段读取，
+        # 本组织声明不误判为身份不符，对齐审计复用同一划段口径
+        raw = _headers(
+            [
+                "Authentication-Results: (mx tier; inbound) edge.org;\n"
+                "\tdkim=pass header.d=mail.partner.example"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(result["own_count"], 1)
+        self.assertEqual(result["status"], "aligned")
+        self.assertEqual(
+            result["claims"][0]["identity_domain"], "mail.partner.example"
+        )
+
+    def test_nested_comment_identity_not_adopted(self):
+        # 嵌套注释内的 header.d 不得当成身份属性（首个身份属性优先，
+        # 注释内容若漏入会抢走该位置）
+        raw = _headers(
+            [
+                "Authentication-Results: edge.org;\n"
+                "\tdkim=pass (see (nested) header.d=evil.example)"
+                " header.d=mail.partner.example"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(result["claims"][0]["identity_raw"], "mail.partner.example")
+        self.assertEqual(result["status"], "aligned")
+
+    def test_escaped_paren_comment_identity_not_adopted(self):
+        # 反斜杠转义的 \) 不结束注释：注释内的分号与 header.d 均不生效
+        raw = _headers(
+            [
+                "Authentication-Results: edge.org;\n"
+                "\tdkim=pass (note \\) ; header.d=evil.example)"
+                " header.d=mail.partner.example"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(result["claims"][0]["identity_raw"], "mail.partner.example")
+        self.assertEqual(result["status"], "aligned")
+
+    def test_comment_claims_not_counted_and_order_kept(self):
+        # 注释内的 dkim=pass 不产生声明；注释外重复声明维持原文顺序
+        raw = _headers(
+            [
+                "Authentication-Results: edge.org;\n"
+                "\tdkim=pass header.d=mail.partner.example;\n"
+                "\t(dkim=pass header.d=evil.example);\n"
+                "\tdkim=fail header.d=attacker.example;\n"
+                "\tdkim=pass header.d=mail.partner.example"
+            ]
+        )
+        result = audit_sender_alignment(raw, HOSTS, ORG, "strict")
+        self.assertEqual(
+            [(c["method"], c["result"]) for c in result["claims"]],
+            [("dkim", "pass"), ("dkim", "fail"), ("dkim", "pass")],
+        )
+        self.assertEqual(result["pass_claim_count"], 2)
+        self.assertEqual(result["aligned_count"], 2)
+        self.assertEqual(result["status"], "aligned")
+
     def test_empty_hostlist_is_input_error(self):
         result = audit_sender_alignment(_headers([]), "  \n, ", ORG, "strict")
         self.assertIn("error", result)
